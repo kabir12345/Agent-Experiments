@@ -6,9 +6,19 @@ from langchain_community.utilities import WikipediaAPIWrapper
 from langchain.agents.agent_types import AgentType
 from langchain.agents import Tool, initialize_agent
 from dotenv import load_dotenv
-
+import agentops
+from agentops.langchain_callback_handler import LangchainCallbackHandler as AgentOpsLangchainCallbackHandler
+from agentops import record_function
+import os
+import pprint
 load_dotenv()
+env_var = os.environ 
+from agentops import track_agent
 
+
+
+agent_ops_keys=os.environ['AGENT_OPS_KEY']
+agentops.init(agent_ops_keys)
 
 @cl.on_chat_start
 def math_chatbot():
@@ -60,10 +70,11 @@ def math_chatbot():
 
 
 @cl.on_message
+
 async def process_user_query(message: cl.Message):
     agent = cl.user_session.get("agent")
-
     response = await agent.acall(message.content,
                                  callbacks=[cl.AsyncLangchainCallbackHandler()])
 
     await cl.Message(response["output"]).send()
+agentops.end_session('Success')
