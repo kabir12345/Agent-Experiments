@@ -1,119 +1,73 @@
 import spotipy
-import spotipy.util as util
 from spotipy.oauth2 import SpotifyClientCredentials
-import random
 import os
-from langchain.pydantic_v1 import BaseModel, Field
-from langchain.tools import BaseTool, StructuredTool, tool
-from langchain_community.chat_models import ChatOpenAI
-from langchain.agents import initialize_agent, Tool
-from langchain.agents import AgentType
-from typing import Optional, Type
-import agentops
-from agentops import track_agent
-from agentops import record_function
-from agentops.langchain_callback_handler import LangchainCallbackHandler as AgentOpsLangchainCallbackHandler
+import random
 from dotenv import load_dotenv
+from langchain import hub
+from langchain.tools import tool
+from langchain_openai import ChatOpenAI
+from langchain.agents import AgentExecutor, create_structured_chat_agent
+import agentops
+from agentops import init, end_session
+from agentops.langchain_callback_handler import LangchainCallbackHandler as AgentOpsLangchainCallbackHandler
+
+# Load environment variables
 load_dotenv()
 
-
-
-agent_ops_keys=os.environ['AGENT_OPS_KEY']
-agentops_handler = AgentOpsLangchainCallbackHandler(api_key=agent_ops_keys, tags=['Music Agent'])
-
+# Spotify API credentials
 client_id = os.environ['Spotify_Client']
-
 client_secret = os.environ['Spotify_Secret']
 
+# AgentOps API Key
+agent_ops_keys=os.environ['AGENT_OPS_KEY']
+# Setting up Spotify client
+spotify_client = spotipy.Spotify(client_credentials_manager=SpotifyClientCredentials(client_id=client_id, client_secret=client_secret))
 
-sp = spotipy.Spotify(client_credentials_manager=SpotifyClientCredentials(client_id=client_id,
-                                                                             client_secret=client_secret))
+def retrieve_artist_id(artist_name: str) -> str:
+    """Retrieve the Spotify ID of an artist given their name."""
+    results = spotify_client.search(q='artist:' + artist_name, type='artist')
+    items = results['artists']['items']
+    if not items:
+        raise ValueError(f"No artist found with name {artist_name}")
+    return items[0]['id']
 
-class MusicInput(BaseModel):
-    artists: list = Field(description="A list of artists that they'd like to see music from")
-    tracks: int = Field(description="The number of tracks/songs they want returned.")
+def retrieve_tracks(artist_id: str, num_tracks: int) -> list:
+    """Retrieve the top tracks of an artist given their Spotify ID."""
+    top_tracks = spotify_client.artist_top_tracks(artist_id)
+    return [track['name'] for track in top_tracks['tracks'][:num_tracks]]
 
-class SpotifyTool(BaseTool):
-    
-    name = "Spotify Music Recommender"
-    description = "Use this tool when asked music recommendations."
-    args_schema: Type[BaseModel] = MusicInput
-    
-    # utils
-    @staticmethod
-    def retrieve_id(artist_name: str) -> str:
-        results = sp.search(q='artist:' + artist_name, type='artist')
-        if len(results) > 0:
-            artist_id = results['artists']['items'][0]['id']
-        else:
-            raise ValueError(f"No artists found with this name: {artist_name}")
-        return artist_id
+@tool
+def get_music_recommendations(artists: list, tracks: int) -> list:
+    """Get music recommendations based on a list of artists and the number of tracks requested."""
+    final_tracks = []
+    for artist in artists:
+        artist_id = retrieve_artist_id(artist)
+        artist_tracks = retrieve_tracks(artist_id, min(tracks, 10))
+        final_tracks.extend(artist_tracks)
+    random.shuffle(final_tracks)
+    return final_tracks[:tracks]
 
-    @staticmethod
-    def retrieve_tracks(artist_id: str, num_tracks: int) -> list:
-        if num_tracks > 10:
-            raise ValueError("Can only provide up to 10 tracks per artist")
-        tracks = []
-        top_tracks = sp.artist_top_tracks(artist_id)
-        for track in top_tracks['tracks'][:num_tracks]:
-            tracks.append(track['name'])
-        return tracks
+# Initialize AgentOps
+agentops_handler = AgentOpsLangchainCallbackHandler(api_key=agent_ops_keys, tags=[' New Music Agent'])
+agentops.init(api_key=agent_ops_keys)
 
-    @staticmethod
-    def all_top_tracks(artist_array: list) -> list:
-        complete_track_arr = []
-        for artist in artist_array:
-            artist_id = SpotifyTool.retrieve_id(artist)
-            all_tracks = {artist: SpotifyTool.retrieve_tracks(artist_id, 10)}
-            complete_track_arr.append(all_tracks)
-        return complete_track_arr
+# Initialize LLM with OpenAI's API
+llm = ChatOpenAI(temperature=0.0, callbacks=[agentops_handler])
+tools = [get_music_recommendations]
 
+# Pull the prompt from LangChain hub
+prompt = hub.pull("hwchase17/structured-chat-agent")
 
-    def _run(self, artists: list, tracks: int) -> list:
-        """
-        A tool to provide music recommendations based on artists provided.
-        """
-        num_artists = len(artists)
-        max_tracks = num_artists * 10
-        print("---------------")
-        print(artists)
-        print(type(artists))
-        print("---------------")
-        all_tracks_map = SpotifyTool.all_top_tracks(artists) # map for artists with top 10 tracks
-        all_tracks = [track for artist_map in all_tracks_map for artist, tracks in artist_map.items() for track in tracks] #complete list of tracks
+# Create the agent with LangChain using the pulled prompt
+agent = create_structured_chat_agent(llm, tools, prompt)
 
-        if tracks > max_tracks:
-            raise ValueError(f"Only 10 tracks per artist, max tracks for this many artists is: {max_tracks}")
-        final_tracks = random.sample(all_tracks, tracks)
-        return final_tracks
+# Create the executor with AgentOps tracking
+executor = AgentExecutor(agent=agent, tools=tools, verbose=True, callbacks=[agentops_handler])
 
-    def _arun(self):
-        raise NotImplementedError("Spotify Music Recommender does not support ")
-        
-tools = [SpotifyTool()]
-llm = ChatOpenAI(temperature=0.0,callbacks=[agentops_handler])
-for t in tools:
-    t.callbacks = [agentops_handler]
+# Invoke the agent
+input_data = {"input": "I like the following artists: Drake, Future. Can I get 5 song recommendations?"}
+response = executor.invoke(input_data)
+print(response)
 
-# @track_agent(name='MusicAgent')
-# class MyAgent:
-#     def __init__(self):
-#         self.agent = initialize_agent(tools, llm, agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION, verbose = True,callbacks=[agentops_handler],handle_parsing_errors=True)
-#         return self.agent
-#     # def run(self, query,callbacks):
-#     #     return self.agent.run(query)
-# agent_new = MyAgent()
-
-# agent_new.run("""I like the following artists:  [Future]
-#                 can I get 6 song recommendations with them in it.""" , callbacks=[agentops_handler])
-agent = initialize_agent(tools,
-                         llm,
-                         agent=AgentType.CHAT_ZERO_SHOT_REACT_DESCRIPTION,
-                         verbose=True,
-                         callbacks=[agentops_handler], # You must pass in a callback handler to record your agent
-                         handle_parsing_errors=True)
-agent.run("""I like the following artists:  [Future]
-#                 can I get 6 song recommendations with them in it.""" , callbacks=[agentops_handler])
-
-
+# End the AgentOps session
 agentops.end_session('Success')
